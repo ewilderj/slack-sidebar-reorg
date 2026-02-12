@@ -6,6 +6,15 @@ automatically.
 
 Designed as an AI coding agent skill, but the scripts work standalone too.
 
+> **⚠️ Before you start:**
+> - **This takes time.** Execution puppets a real browser, clicking through
+>   Slack menus one channel at a time. A sidebar with 200+ channels can take
+>   20–30 minutes to fully reorganize.
+> - **This is destructive.** Once you approve and execute, your existing sidebar
+>   sections are deleted and rebuilt from scratch. You can stop at the design
+>   phase (reviewing the proposed layout) without changing anything — but once
+>   execution starts, your current sidebar organization will be replaced.
+
 ## Install as an Agent Skill
 
 This repo is structured as an agent skill with a `SKILL.md` that teaches the
