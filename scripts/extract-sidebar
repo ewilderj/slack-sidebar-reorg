@@ -1,0 +1,535 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""Extract the current Slack sidebar structure as JSON.
+
+Launches a Playwright browser with an existing SSO session, scrolls the
+virtualized sidebar to capture all sections and channels, and outputs
+structured JSON to stdout. Progress messages go to stderr.
+
+Session profiles are stored in ~/.slack-reorg/sessions/{workspace-hostname}/
+Use `scripts/login` to set up a session if you haven't already.
+
+Usage:
+    uv run scripts/extract-sidebar
+    uv run scripts/extract-sidebar --workspace https://myco.slack.com
+"""
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+# Allow importing session_helper from same directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from session_helper import session_dir_for_workspace
+
+
+
+
+async def navigate_to_slack(page, workspace_url, timeout=45000):
+    """Navigate to Slack, handling the 'open in app' interstitial."""
+    # Use /messages/ path (archives triggers extra redirects)
+    url = f"{workspace_url.rstrip('/')}/messages/general"
+    print(f"Navigating to {url}...", file=sys.stderr)
+    await page.goto(url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    # Handle interstitial "Launching X" pages
+    for attempt in range(2):
+        title = await page.title()
+        if "Redirect" not in title and "Launch" not in title:
+            break
+        print(f"  Interstitial detected (attempt {attempt + 1}), clicking 'open in browser'...", file=sys.stderr)
+        browser_link = await page.query_selector('a:has-text("browser")')
+        if browser_link:
+            await browser_link.click()
+            await page.wait_for_timeout(3000)
+
+    try:
+        await page.wait_for_selector(
+            '[role="tree"][data-qa="slack_kit_list"]', timeout=timeout
+        )
+        print("Workspace loaded.", file=sys.stderr)
+        return True
+    except Exception:
+        print("ERROR: Workspace sidebar did not load.", file=sys.stderr)
+        return False
+
+
+async def find_scroll_container(page):
+    """Find the scrollable container wrapping the sidebar tree."""
+    return await page.evaluate('''() => {
+        const tree = document.querySelector('[role="tree"][data-qa="slack_kit_list"]');
+        if (!tree) return { error: "no sidebar tree found" };
+        let el = tree;
+        while (el) {
+            const style = window.getComputedStyle(el);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                return {
+                    found: true,
+                    scrollHeight: el.scrollHeight,
+                    clientHeight: el.clientHeight,
+                };
+            }
+            el = el.parentElement;
+        }
+        return { found: false, scrollHeight: tree.scrollHeight, clientHeight: tree.clientHeight };
+    }''')
+
+
+async def scroll_to(page, position):
+    """Scroll the sidebar to a given pixel offset."""
+    await page.evaluate('''(pos) => {
+        const tree = document.querySelector('[role="tree"][data-qa="slack_kit_list"]');
+        let el = tree;
+        while (el) {
+            const style = window.getComputedStyle(el);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                el.scrollTop = pos;
+                return;
+            }
+            el = el.parentElement;
+        }
+        if (tree) tree.scrollTop = pos;
+    }''', position)
+
+
+async def capture_visible_items(page):
+    """Capture all currently rendered treeitems."""
+    return await page.evaluate('''() => {
+        const treeitems = document.querySelectorAll('[role="tree"] [role="treeitem"]');
+        const result = [];
+        for (const item of treeitems) {
+            const text = item.textContent?.trim().replace(/\\s+/g, ' ').substring(0, 120) || "";
+            const ariaLabel = item.getAttribute("aria-label") || "";
+            const ariaExpanded = item.getAttribute("aria-expanded");
+            const level = item.getAttribute("aria-level") || "";
+            const channelEl = item.querySelector('[data-qa="channel-sidebar-channel"]');
+            const channelName = channelEl ? channelEl.textContent?.trim() || "" : "";
+            const sectionEl = item.querySelector('[data-qa*="section_heading"]');
+            const sectionName = sectionEl ? sectionEl.textContent?.trim() || "" : "";
+            // Capture section ID if present
+            const toggleBtn = item.querySelector('[data-qa^="section_heading_toggle_and_label__"]');
+            const sectionId = toggleBtn ? (toggleBtn.getAttribute("data-qa") || "").replace("section_heading_toggle_and_label__", "") : "";
+            // Capture top position for correct ordering (virtual list recycles DOM elements)
+            // Check both top: and transform: translateY() styles
+            const style = item.getAttribute("style") || "";
+            let topPx = -1;
+            const topMatch = style.match(/top:\\s*([\\d.]+)px/);
+            if (topMatch) {
+                topPx = parseFloat(topMatch[1]);
+            } else {
+                const translateMatch = style.match(/translateY\\(([\\d.]+)px\\)/);
+                if (translateMatch) {
+                    topPx = parseFloat(translateMatch[1]);
+                } else {
+                    // Fall back to offsetTop relative to scroll container
+                    topPx = item.offsetTop || -1;
+                }
+            }
+            result.push({ text, ariaLabel, ariaExpanded, level, channelName, sectionName, sectionId, topPx });
+        }
+        return result;
+    }''')
+
+
+
+async def expand_collapsed_sections(page, scroll_height, client_height, step_size):
+    """Scroll through sidebar and click to expand any collapsed sections.
+
+    Only expands custom sections — built-in sections (Starred, VIP unreads,
+    External Connections, Direct messages, Channels, Apps) are skipped because
+    expanding them (especially DMs with hundreds of entries) bloats the sidebar
+    and disrupts channel attribution in subsequent capture passes.
+    """
+    # Built-in sections to skip — these don't need expansion for reorg purposes
+    SKIP_SECTIONS = {"Direct messages", "Apps"}
+
+    steps = (scroll_height - client_height) // step_size + 1
+    expanded_count = 0
+
+    await scroll_to(page, 0)
+    await page.wait_for_timeout(500)
+
+    seen_sections = set()
+    for step in range(steps + 5):
+        await scroll_to(page, step * step_size)
+        await page.wait_for_timeout(150)
+
+        collapsed = await page.query_selector_all('[role="treeitem"][aria-expanded="false"]')
+        for section_el in collapsed:
+            # Get the clean section name from the heading element
+            heading = await section_el.query_selector('[data-qa*="section_heading"]')
+            if heading:
+                text = await heading.text_content()
+            else:
+                text = await section_el.text_content()
+            text = (text or "").strip()
+            if not text or text in seen_sections:
+                continue
+            seen_sections.add(text)
+
+            # Check if this is a built-in section to skip
+            if any(text.startswith(skip) for skip in SKIP_SECTIONS):
+                print(f"  Skipping built-in section: '{text[:50]}'", file=sys.stderr)
+                continue
+
+            # Click the toggle button to expand (data-qa, not id)
+            toggle = await section_el.query_selector('[data-qa^="section_heading_toggle_and_label__"]')
+            if toggle:
+                print(f"  Expanding: '{text}'", file=sys.stderr)
+                await toggle.click()
+                await page.wait_for_timeout(800)
+                expanded_count += 1
+            else:
+                # Fallback: click the section heading label
+                label = await section_el.query_selector('[data-qa^="channel_sidebar__section_heading_label__"]')
+                if label:
+                    print(f"  Expanding (via label): '{text}'", file=sys.stderr)
+                    await label.click()
+                    await page.wait_for_timeout(800)
+                    expanded_count += 1
+                else:
+                    print(f"  WARNING: no toggle/label found for '{text}'", file=sys.stderr)
+
+    if expanded_count:
+        print(f"  Expanded {expanded_count} collapsed section(s)", file=sys.stderr)
+        # Give the sidebar time to settle after expansions
+        await page.wait_for_timeout(1000)
+
+    return expanded_count
+
+
+async def collapse_builtin_sections(page, scroll_height, client_height, step_size):
+    """Collapse built-in sections that shouldn't be open during capture.
+
+    DMs and Apps can have hundreds of items that bloat the sidebar and push
+    other sections out of the virtual list viewport, causing misattribution.
+    """
+    COLLAPSE_SECTIONS = {"Direct messages", "Apps"}
+    steps = (scroll_height - client_height) // step_size + 1
+    collapsed_count = 0
+
+    await scroll_to(page, 0)
+    await page.wait_for_timeout(500)
+
+    seen = set()
+    for step in range(steps + 5):
+        await scroll_to(page, step * step_size)
+        await page.wait_for_timeout(150)
+
+        expanded = await page.query_selector_all('[role="treeitem"][aria-expanded="true"]')
+        for section_el in expanded:
+            heading = await section_el.query_selector('[data-qa*="section_heading"]')
+            if heading:
+                text = await heading.text_content()
+            else:
+                text = await section_el.text_content()
+            text = (text or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+
+            if any(text.startswith(s) for s in COLLAPSE_SECTIONS):
+                toggle = await section_el.query_selector('[data-qa^="section_heading_toggle_and_label__"]')
+                if toggle:
+                    print(f"  Collapsing built-in section: '{text[:50]}'", file=sys.stderr)
+                    await toggle.click()
+                    await page.wait_for_timeout(500)
+                    collapsed_count += 1
+
+    if collapsed_count:
+        print(f"  Collapsed {collapsed_count} built-in section(s)", file=sys.stderr)
+        await page.wait_for_timeout(1000)
+
+    return collapsed_count
+
+
+async def dismiss_all(page):
+    """Dismiss any lingering menus, modals, or overlays."""
+    for _ in range(5):
+        has = await page.evaluate('''() =>
+            !!document.querySelector('.ReactModal__Overlay') ||
+            !!document.querySelector('[role="menu"]')
+        ''')
+        if has:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        else:
+            break
+
+
+async def find_section_treeitem(page, name):
+    """Find a section treeitem by its heading text, scrolling if needed."""
+    # First check without scrolling
+    sections = await page.query_selector_all('[role="treeitem"][aria-expanded]')
+    for sec in sections:
+        h = await sec.query_selector('[data-qa*="section_heading"]')
+        if h:
+            t = (await h.text_content() or "").strip()
+            if t == name:
+                return sec
+
+    # Scroll through the sidebar to find it (virtualised list)
+    step_size = 80
+    max_scroll = 15000
+    steps = max_scroll // step_size
+    for step in range(steps):
+        await scroll_to(page, step * step_size)
+        await page.wait_for_timeout(100)
+        sections = await page.query_selector_all('[role="treeitem"][aria-expanded]')
+        for sec in sections:
+            h = await sec.query_selector('[data-qa*="section_heading"]')
+            if h:
+                t = (await h.text_content() or "").strip()
+                if t == name:
+                    return sec
+    return None
+
+
+async def switch_sidebar_to_all_activity(page):
+    """Switch the sidebar to show all channels via the cog settings menu.
+
+    Uses the sidebar cog → Filter and Sort → All Activity, which is a single
+    workspace-wide setting that shows all channels including dormant ones.
+    """
+    await dismiss_all(page)
+    await scroll_to(page, 0)
+    await page.wait_for_timeout(500)
+
+    # The sidebar settings gear is data-qa="sweeper_button" with
+    # aria-label="Manage my sidebar".  It lives in the sidebar header,
+    # not inside the [role="tree"].
+    COG_SELECTORS = [
+        '[data-qa="sweeper_button"]',
+        'button[aria-label="Manage my sidebar"]',
+    ]
+
+    cog = None
+    for sel in COG_SELECTORS:
+        cog = await page.query_selector(sel)
+        if cog:
+            print(f"  Found cog via: {sel}", file=sys.stderr)
+            break
+
+    if not cog:
+        print("  WARNING: Sidebar cog (sweeper_button) not found", file=sys.stderr)
+        return False
+
+    await cog.click(force=True)
+    await page.wait_for_timeout(1500)
+
+    # Click "Filter and sort" — its text includes a faux status indicator
+    # like "All" appended, so match on the prefix.
+    filter_btn = None
+    items = await page.query_selector_all('[role="menuitem"]')
+    for item in items:
+        text = (await item.text_content() or "").strip()
+        if text.startswith("Filter and sort"):
+            filter_btn = item
+            break
+
+    if not filter_btn:
+        print("  WARNING: 'Filter and sort' menu item not found", file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+
+    await filter_btn.click(force=True)
+    await page.wait_for_timeout(1500)
+
+    # A submenu replaced the parent menu. Find "All activity" in it.
+    # The item is role="menuitemcheckbox" and text may contain linebreaks.
+    all_btn = None
+    submenu_items = await page.query_selector_all(
+        '[role="menuitemradio"], [role="menuitemcheckbox"], '
+        '[role="option"], [role="menuitem"]')
+    texts = []
+    for item in submenu_items:
+        text = " ".join((await item.text_content() or "").split())
+        texts.append(text)
+        if "All activity" in text:
+            all_btn = item
+            break
+
+    if not all_btn:
+        print(f"  WARNING: 'All activity' not found. Items: {texts[:15]}",
+              file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+
+    await all_btn.click()
+    await page.wait_for_timeout(2000)
+    print("  Switched sidebar to show all channels.", file=sys.stderr)
+    return True
+
+
+async def extract_sidebar(session_dir, workspace_url, headless=False):
+    """Main extraction routine."""
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=session_dir,
+            headless=headless,
+            viewport={"width": 1400, "height": 900},
+            slow_mo=50,
+            args=["--disable-features=ExternalProtocolDialog"],
+        )
+
+        page = await context.new_page()
+
+        if not await navigate_to_slack(page, workspace_url):
+            await context.close()
+            return None
+
+        await page.wait_for_timeout(2000)
+
+        # Switch sidebar to show all channels (including dormant ones)
+        print("Switching sidebar to show all channels...", file=sys.stderr)
+        await switch_sidebar_to_all_activity(page)
+        await page.wait_for_timeout(2000)
+
+        container = await find_scroll_container(page)
+        print(f"Scroll container: {json.dumps(container)}", file=sys.stderr)
+
+        scroll_height = container.get("scrollHeight", 10000)
+        client_height = container.get("clientHeight", 800)
+        expand_step = 150
+
+        # Pass 0: expand any collapsed sections so their channels render
+        expanded = await expand_collapsed_sections(page, scroll_height, client_height, expand_step)
+
+        # Re-measure scroll height if sections were expanded
+        if expanded:
+            container = await find_scroll_container(page)
+            scroll_height = container.get("scrollHeight", scroll_height)
+            print(f"  Updated scroll height after expansion: {scroll_height}", file=sys.stderr)
+
+        # Pass 0b: collapse DMs/Apps to keep sidebar manageable for capture
+        collapsed = await collapse_builtin_sections(page, scroll_height, client_height, expand_step)
+        if collapsed:
+            container = await find_scroll_container(page)
+            scroll_height = container.get("scrollHeight", scroll_height)
+            print(f"  Updated scroll height after collapse: {scroll_height}", file=sys.stderr)
+
+        # Scroll and collect: dedup by name (not position) to handle items
+        # positioned via different CSS strategies (top vs transform vs none).
+        all_items = {}  # topPx -> item for ordering
+        seen_names = set()  # channel/section names already captured
+
+        async def scroll_and_collect():
+            """Scroll top-to-bottom, collecting all items."""
+            container = await find_scroll_container(page)
+            sh = container.get("scrollHeight", 10000)
+            print(f"  Scroll height: {sh}px", file=sys.stderr)
+            await scroll_to(page, 0)
+            await page.wait_for_timeout(500)
+            step_size = 80
+            no_new_count = 0
+            step = 0
+            max_steps = (sh // step_size) + 30
+            while step < max_steps:
+                pos = step * step_size
+                await scroll_to(page, pos)
+                await page.wait_for_timeout(150)
+                items = await capture_visible_items(page)
+                new = 0
+                for item in items:
+                    # Dedup by name, not position
+                    name = item.get("channelName") or item.get("sectionName") or ""
+                    if not name:
+                        continue
+                    if name in seen_names:
+                        continue
+                    seen_names.add(name)
+                    top = item.get("topPx", -1)
+                    # Use a synthetic position if topPx not available
+                    if top < 0 or top in all_items:
+                        top = max(all_items.keys(), default=-1) + 1
+                    all_items[top] = item
+                    new += 1
+                if new > 0:
+                    no_new_count = 0
+                else:
+                    no_new_count += 1
+                step += 1
+                # Only exit early if we've scrolled the full range
+                if pos > sh and no_new_count >= 10:
+                    break
+
+        await scroll_and_collect()
+        print(f"  Collected {len(all_items)} items", file=sys.stderr)
+
+        # Sort by topPx to get correct visual order (virtual list recycles DOM elements)
+        ordered_items = [all_items[k] for k in sorted(all_items.keys())]
+
+        # Organize into sections
+        sections = []
+        current_section = {"name": "(ungrouped)", "id": "", "channels": []}
+        for item in ordered_items:
+            if item.get("ariaExpanded") is not None:
+                if current_section["channels"] or current_section["name"] != "(ungrouped)":
+                    sections.append(current_section)
+                current_section = {
+                    "name": item.get("sectionName") or item["text"],
+                    "id": item.get("sectionId", ""),
+                    "expanded": item["ariaExpanded"] == "true",
+                    "channels": [],
+                }
+            elif item.get("channelName"):
+                current_section["channels"].append(item["channelName"])
+        if current_section["channels"] or current_section["name"] != "(ungrouped)":
+            sections.append(current_section)
+
+        total_channels = sum(len(s['channels']) for s in sections)
+
+        # Print per-section diagnostics
+        custom_count = 0
+        for s in sections:
+            ch_count = len(s['channels'])
+            label = "builtin" if s['name'] in {"Starred", "VIP unreads", "External Connections", "Channels", "Direct messages", "Apps"} else "custom"
+            if label == "custom":
+                custom_count += 1
+            print(f"  {s['name']}: {ch_count} channels ({label})", file=sys.stderr)
+
+        output = {
+            "workspace": workspace_url,
+            "total_items": len(ordered_items),
+            "sections": sections,
+        }
+
+        print(f"\nExtracted {len(sections)} sections ({custom_count} custom), {total_channels} channels.",
+              file=sys.stderr)
+
+        await context.close()
+        return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Extract Slack sidebar structure as JSON")
+    parser.add_argument("--session-dir", default=None,
+                        help="Path to Playwright browser profile (default: ~/.slack-reorg/sessions/{workspace}/")
+    parser.add_argument("--workspace", required=True,
+                        help="Slack workspace URL (e.g., https://mycompany.slack.com)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run browser headlessly (may not work with SSO)")
+    args = parser.parse_args()
+
+    if args.session_dir:
+        session_dir = str(Path(args.session_dir).expanduser().resolve())
+    else:
+        session_dir = session_dir_for_workspace(args.workspace)
+    result = asyncio.run(extract_sidebar(session_dir, args.workspace, args.headless))
+
+    if result:
+        print(json.dumps(result, indent=2))
+    else:
+        print("Extraction failed.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

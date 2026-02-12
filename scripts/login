@@ -1,0 +1,133 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""First-time setup and Slack SSO login for slack-reorg.
+
+Handles:
+1. Checking/installing Playwright Chromium browser
+2. Opening a visible browser for Slack SSO authentication
+3. Persisting the browser session for later use by other scripts
+
+Session profiles are stored in ~/.slack-reorg/sessions/{workspace-hostname}/
+
+Usage:
+    uv run scripts/login
+    uv run scripts/login --workspace https://myco.slack.com
+"""
+import argparse
+import asyncio
+import sys
+
+# Allow importing session_helper from same directory
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from session_helper import (
+    session_dir_for_workspace,
+    has_session,
+    ensure_playwright,
+    install_playwright_chromium,
+)
+
+
+
+
+async def login(workspace_url):
+    """Open a browser for Slack SSO login and persist the session."""
+    from playwright.async_api import async_playwright
+
+    session_dir = session_dir_for_workspace(workspace_url)
+    existing = has_session(workspace_url)
+
+    if existing:
+        print(f"Existing session found at {session_dir}", file=sys.stderr)
+        print("Opening browser to verify / refresh session...", file=sys.stderr)
+    else:
+        print(f"No existing session. Creating new profile at {session_dir}", file=sys.stderr)
+
+    url = f"{workspace_url.rstrip('/')}/messages/general"
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=session_dir,
+            headless=False,
+            viewport={"width": 1200, "height": 800},
+            args=["--disable-features=ExternalProtocolDialog"],
+        )
+
+        page = await context.new_page()
+        print(f"\nNavigating to {url}", file=sys.stderr)
+        print("Complete SSO login in the browser window.", file=sys.stderr)
+        print("Once you see the Slack workspace loaded, come back here.\n", file=sys.stderr)
+
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        # Handle interstitial "open in app" pages
+        for attempt in range(2):
+            title = await page.title()
+            if "Redirect" not in title and "Launch" not in title:
+                break
+            browser_link = await page.query_selector('a:has-text("browser")')
+            if browser_link:
+                await browser_link.click()
+                await page.wait_for_timeout(3000)
+
+        # Wait for the sidebar to appear — this means login succeeded
+        print("Waiting for Slack to load (up to 5 minutes for SSO)...", file=sys.stderr)
+        try:
+            await page.wait_for_selector(
+                '[role="tree"][data-qa="slack_kit_list"]',
+                timeout=300000,  # 5 minutes for SSO flow
+            )
+            print("\n✓ Login successful! Slack workspace loaded.", file=sys.stderr)
+            print(f"✓ Session saved to {session_dir}", file=sys.stderr)
+            print("  You can close this browser window.", file=sys.stderr)
+        except Exception:
+            print("\n✗ Timed out waiting for Slack to load.", file=sys.stderr)
+            print("  If SSO is still in progress, try again.", file=sys.stderr)
+            print(f"  Session dir: {session_dir}", file=sys.stderr)
+
+        # Keep browser open briefly so user can see the result
+        await page.wait_for_timeout(3000)
+        await context.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Set up Playwright and log into Slack for sidebar reorganization"
+    )
+    parser.add_argument(
+        "--workspace", required=True,
+        help="Slack workspace URL (e.g., https://mycompany.slack.com)"
+    )
+    args = parser.parse_args()
+
+    # Step 1: Playwright is declared as a dependency in the inline script
+    # metadata, so uv handles installation automatically. Just verify it loaded.
+    print("=== Slack Reorg: First-Time Setup ===\n", file=sys.stderr)
+    ok, msg = ensure_playwright()
+    if not ok:
+        print(msg, file=sys.stderr)
+        print("\nPlaywright should be installed by uv automatically.", file=sys.stderr)
+        print("If this failed, try: uv run --with playwright scripts/login", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: Install Chromium if needed
+    print("Checking Chromium browser...", file=sys.stderr)
+    ok, msg = install_playwright_chromium()
+    if ok:
+        print(f"  {msg}", file=sys.stderr)
+    else:
+        print(f"  {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 3: Open browser for login
+    print(f"\nOpening browser for {args.workspace}...\n", file=sys.stderr)
+    asyncio.run(login(args.workspace))
+
+
+if __name__ == "__main__":
+    main()

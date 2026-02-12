@@ -1,0 +1,261 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Compare current Slack sidebar against a desired layout config.
+
+Reads the sidebar JSON (from extract-sidebar) and a YAML config, then outputs
+a JSON action plan describing what needs to change: sections to create, channels
+to move, and sections to delete.
+
+Usage:
+    uv run scripts/diff-layout --current /tmp/sidebar.json --desired configs/layout.yaml
+    uv run scripts/diff-layout --current /tmp/sidebar.json --desired configs/layout.yaml --pretty
+"""
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import yaml
+
+
+def load_sidebar(path):
+    """Load sidebar JSON and build section→channels mapping."""
+    with open(path) as f:
+        data = json.load(f)
+
+    # Build channel→section mapping
+    channel_to_section = {}
+    section_channels = defaultdict(list)
+    section_names = []
+    unmovable_sections = set()  # Sections whose channels can't be moved
+
+    for section in data.get("sections", []):
+        name = section.get("name", "")
+        section_id = section.get("id", "")
+        section_names.append(name)
+        
+        # Mark built-in sections that don't allow channel moves
+        if section_id in ("slack_connect", "drafts"):
+            unmovable_sections.add(name)
+        
+        for ch in section.get("channels", []):
+            channel_to_section[ch] = name
+            section_channels[name].append(ch)
+
+    return {
+        "raw": data,
+        "channel_to_section": channel_to_section,
+        "section_channels": dict(section_channels),
+        "section_names": section_names,
+        "all_channels": set(channel_to_section.keys()),
+        "unmovable_sections": unmovable_sections,
+    }
+
+
+def load_config(path):
+    """Load desired layout YAML config."""
+    with open(path) as f:
+        config = yaml.safe_load(f)
+
+    sections = []
+    all_desired_channels = set()
+
+    for section in config.get("sections", []):
+        name = section["name"]
+        channels = section.get("channels", [])
+        sections.append({"name": name, "channels": channels})
+        all_desired_channels.update(channels)
+
+    keep_sections = set(config.get("keep_sections", []))
+
+    return {
+        "raw": config,
+        "sections": sections,
+        "all_channels": all_desired_channels,
+        "keep_sections": keep_sections,
+        "workspace": config.get("workspace", ""),
+        "session_dir": config.get("session_dir", ""),
+    }
+
+
+def compute_diff(current, desired):
+    """Compute the action plan to transform current into desired layout.
+
+    Strategy: delete ALL existing custom sections first, then recreate them
+    fresh with emoji. This ensures emoji are always set correctly and avoids
+    "section already exists" failures. Every channel then gets moved into
+    its target section.
+    """
+    current_sections = set(current["section_names"])
+    desired_section_names = {s["name"] for s in desired["sections"]}
+
+    # Built-in sections cannot be deleted via context menu
+    BUILTIN_SECTIONS = {"Starred", "VIP unreads", "External Connections",
+                        "Channels", "Direct messages", "Apps"}
+
+    # Delete ALL existing custom sections that are in the desired config
+    # (they'll be recreated fresh with correct emoji)
+    # Also delete sections not in desired and not in keep_sections
+    delete_sections = []
+    for name in current["section_names"]:
+        if name in BUILTIN_SECTIONS:
+            continue
+        # Strip emoji from current section name for comparison
+        _, text_only = _split_emoji(name)
+        desired_texts = {_split_emoji(s["name"])[1] for s in desired["sections"]}
+        if text_only in desired_texts or name in desired_section_names:
+            delete_sections.append(name)
+        elif name not in desired.get("keep_sections", set()):
+            delete_sections.append(name)
+
+    # Recreate ALL desired sections (fresh, with emoji)
+    create_sections = [s["name"] for s in desired["sections"]]
+
+    # ALL channels in desired config need to be moved (since sections are fresh)
+    moves = []
+    skipped_unmovable = []
+    for section in desired["sections"]:
+        target = section["name"]
+        for channel in section["channels"]:
+            if channel not in current["all_channels"]:
+                continue  # channel not in sidebar
+            # Skip channels in unmovable sections (Slack Connect, drafts, etc.)
+            current_section = current["channel_to_section"].get(channel)
+            if current_section in current.get("unmovable_sections", set()):
+                skipped_unmovable.append(channel)
+                continue
+            moves.append({
+                "channel": channel,
+                "from": current_section or "?",
+                "to": target,
+            })
+
+    # Warnings
+    warnings = []
+
+    # Unmovable channels that were skipped
+    if skipped_unmovable:
+        for ch in sorted(skipped_unmovable):
+            section = current["channel_to_section"].get(ch, "?")
+            warnings.append(f"Skipped unmovable channel '{ch}' (in {section})")
+
+    # Channels in config but not in sidebar
+    missing = desired["all_channels"] - current["all_channels"]
+    for ch in sorted(missing):
+        warnings.append(f"Channel '{ch}' is in config but not in current sidebar")
+
+    # Channels in sidebar but not in any config section (and not in keep_sections)
+    keep_section_channels = set()
+    for name in desired.get("keep_sections", set()):
+        keep_section_channels.update(current["section_channels"].get(name, []))
+
+    unassigned = current["all_channels"] - desired["all_channels"] - keep_section_channels
+    for ch in sorted(unassigned):
+        section = current["channel_to_section"].get(ch, "?")
+        warnings.append(f"Channel '{ch}' (in '{section}') not assigned in config — will stay in place")
+
+    return {
+        "delete_sections": delete_sections,
+        "create_sections": create_sections,
+        "moves": moves,
+        "warnings": warnings,
+        "stats": {
+            "sections_to_delete": len(delete_sections),
+            "sections_to_create": len(create_sections),
+            "channels_to_move": len(moves),
+            "warnings": len(warnings),
+        },
+    }
+
+
+def _split_emoji(name):
+    """Split '🔥 Daily Ops' into ('🔥', 'Daily Ops')."""
+    import re
+    EMOJI_RE = re.compile(
+        r'^([\U0001F300-\U0001FAD6\u2600-\u27BF\uFE00-\uFE0F\u200D'
+        r'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F]+)\s*')
+    m = EMOJI_RE.match(name)
+    if m:
+        return m.group(1).strip(), name[m.end():].strip()
+    return '', name.strip()
+
+
+def format_pretty(plan):
+    """Format the action plan as readable text."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("SLACK REORGANIZATION PLAN")
+    lines.append("=" * 60)
+
+    stats = plan["stats"]
+    lines.append(f"\nDelete {stats['sections_to_delete']} sections, "
+                 f"create {stats['sections_to_create']} sections, "
+                 f"move {stats['channels_to_move']} channels.")
+
+    if plan["delete_sections"]:
+        lines.append(f"\n--- Delete {len(plan['delete_sections'])} sections ---")
+        for name in plan["delete_sections"]:
+            lines.append(f"  ✕ {name}")
+
+    if plan["create_sections"]:
+        lines.append(f"\n--- Create {len(plan['create_sections'])} sections ---")
+        for name in plan["create_sections"]:
+            lines.append(f"  + {name}")
+
+    if plan["moves"]:
+        lines.append(f"\n--- Move {len(plan['moves'])} channels ---")
+        # Group by target section for readability
+        by_target = defaultdict(list)
+        for move in plan["moves"]:
+            by_target[move["to"]].append(move)
+        for target in sorted(by_target.keys()):
+            target_moves = by_target[target]
+            lines.append(f"\n  → {target} ({len(target_moves)} channels):")
+            for move in sorted(target_moves, key=lambda m: m["channel"]):
+                lines.append(f"    #{move['channel']}  (from {move['from']})")
+
+    if plan["delete_sections"]:
+        lines.append(f"\n--- Delete {len(plan['delete_sections'])} sections ---")
+        for name in plan["delete_sections"]:
+            lines.append(f"  ✕ {name}")
+
+    if plan["warnings"]:
+        lines.append(f"\n--- {len(plan['warnings'])} warnings ---")
+        for w in plan["warnings"]:
+            lines.append(f"  ⚠ {w}")
+
+    lines.append("")
+    est_minutes = (stats["channels_to_move"] * 5 + stats["sections_to_create"] * 5
+                   + stats["sections_to_delete"] * 3) // 60
+    lines.append(f"Estimated execution time: ~{max(est_minutes, 1)} minutes")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Diff current Slack sidebar against desired layout")
+    parser.add_argument("--current", required=True,
+                        help="Path to current sidebar JSON (from extract-sidebar)")
+    parser.add_argument("--desired", required=True,
+                        help="Path to desired layout YAML config")
+    parser.add_argument("--pretty", action="store_true",
+                        help="Output human-readable text instead of JSON")
+    args = parser.parse_args()
+
+    current = load_sidebar(Path(args.current).expanduser())
+    desired = load_config(Path(args.desired).expanduser())
+
+    plan = compute_diff(current, desired)
+
+    if args.pretty:
+        print(format_pretty(plan))
+    else:
+        print(json.dumps(plan, indent=2))
+
+
+if __name__ == "__main__":
+    main()

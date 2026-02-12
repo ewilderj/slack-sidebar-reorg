@@ -1,0 +1,894 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""Execute a Slack sidebar reorganization plan via Playwright browser automation.
+
+Reads an action plan JSON (from diff-layout) and puppets the Slack UI to create
+sections, move channels, and delete empty sections.
+
+Session profiles are stored in ~/.slack-reorg/sessions/{workspace-hostname}/
+Use `scripts/login` to set up a session if you haven't already.
+
+Usage:
+    # Dry run (show what would happen):
+    uv run scripts/execute-reorg --plan /tmp/action-plan.json --dry-run
+
+    # Execute for real:
+    uv run scripts/execute-reorg --plan /tmp/action-plan.json
+"""
+import argparse
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+# Allow importing session_helper from same directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import re
+from session_helper import session_dir_for_workspace
+
+
+
+
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
+
+async def navigate_to_slack(page, workspace_url, timeout=45000):
+    """Navigate to Slack, handling the 'open in app' interstitial."""
+    url = f"{workspace_url.rstrip('/')}/messages/general"
+    print(f"Navigating to {url}...", file=sys.stderr)
+    await page.goto(url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    for attempt in range(2):
+        title = await page.title()
+        if "Redirect" not in title and "Launch" not in title:
+            break
+        print(f"  Interstitial (attempt {attempt + 1}), clicking 'open in browser'...", file=sys.stderr)
+        browser_link = await page.query_selector('a:has-text("browser")')
+        if browser_link:
+            await browser_link.click()
+            await page.wait_for_timeout(3000)
+
+    try:
+        await page.wait_for_selector(
+            '[role="tree"][data-qa="slack_kit_list"]', timeout=timeout
+        )
+        print("Workspace loaded.", file=sys.stderr)
+        return True
+    except Exception:
+        print("ERROR: Workspace sidebar did not load.", file=sys.stderr)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Sidebar utilities
+# ---------------------------------------------------------------------------
+
+async def dismiss_menus(page):
+    """Dismiss any lingering menus, modals, or ReactModal overlays.
+
+    ReactModal overlays block pointer events on sidebar elements so must be
+    cleared before every operation that touches the sidebar.
+    """
+    for _ in range(5):
+        has = await page.evaluate('''() =>
+            !!document.querySelector('.ReactModal__Overlay') ||
+            !!document.querySelector('[role="menu"]')
+        ''')
+        if has:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        else:
+            break
+
+
+async def scroll_to(page, position):
+    """Scroll the sidebar to a pixel offset."""
+    await page.evaluate('''(pos) => {
+        const tree = document.querySelector('[role="tree"][data-qa="slack_kit_list"]');
+        let el = tree;
+        while (el) {
+            const style = window.getComputedStyle(el);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                el.scrollTop = pos;
+                return;
+            }
+            el = el.parentElement;
+        }
+        if (tree) tree.scrollTop = pos;
+    }''', position)
+
+
+async def get_scroll_height(page):
+    """Get the scroll height of the sidebar container."""
+    return await page.evaluate('''() => {
+        const tree = document.querySelector('[role="tree"][data-qa="slack_kit_list"]');
+        let el = tree;
+        while (el) {
+            const style = window.getComputedStyle(el);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                return el.scrollHeight;
+            }
+            el = el.parentElement;
+        }
+        return tree ? tree.scrollHeight : 0;
+    }''')
+
+
+async def find_channel_in_sidebar(page, channel_name, max_scroll=15000):
+    """Scroll sidebar to find a channel by exact text match.
+
+    Uses query_selector_all on [role="treeitem"] and checks nested
+    channel-sidebar-channel text — :has-text() is unreliable in Slack's
+    virtualised list because elements contain icons and badges.
+
+    Returns the treeitem element if found, or None.
+    """
+    step_size = 80  # ~2 items per step; items are 28-36px tall
+    steps = max_scroll // step_size
+
+    for step in range(steps):
+        await scroll_to(page, step * step_size)
+        await page.wait_for_timeout(100)
+
+        treeitems = await page.query_selector_all('[role="treeitem"]')
+        for ti in treeitems:
+            ch = await ti.query_selector('[data-qa="channel-sidebar-channel"]')
+            if ch:
+                text = await ch.text_content()
+                if text and text.strip() == channel_name:
+                    return ti
+
+    return None
+
+
+async def find_section_in_sidebar(page, section_name, max_scroll=15000):
+    """Find a section header by text-only name.
+
+    First tries to find it among currently rendered treeitems without
+    scrolling. Falls back to scrolling in large steps if not found.
+    Returns the treeitem element if found, or None.
+    """
+    # Fast path: check all currently rendered sections without scrolling
+    sections = await page.query_selector_all('[role="treeitem"][aria-expanded]')
+    for sec in sections:
+        h = await sec.query_selector('[data-qa*="section_heading"]')
+        if h:
+            t = (await h.text_content() or "").strip()
+            _, text_only = split_emoji_name(t)
+            if text_only == section_name or t == section_name:
+                return sec
+
+    # Slow path: scroll to find it (large steps for speed)
+    step_size = 400
+    steps = max_scroll // step_size
+    for step in range(steps):
+        await scroll_to(page, step * step_size)
+        await page.wait_for_timeout(100)
+
+        sections = await page.query_selector_all('[role="treeitem"][aria-expanded]')
+        for sec in sections:
+            h = await sec.query_selector('[data-qa*="section_heading"]')
+            if h:
+                t = (await h.text_content() or "").strip()
+                _, text_only = split_emoji_name(t)
+                if text_only == section_name or t == section_name:
+                    return sec
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Emoji / section name utilities
+# ---------------------------------------------------------------------------
+
+# Regex matching common Unicode emoji ranges (covers most sidebar emoji)
+_EMOJI_RE = re.compile(
+    r'^([\U0001F300-\U0001F9FF\U00002600-\U000027BF\U0000FE00-\U0000FE0F'
+    r'\U0000200D\U00002702-\U000027B0\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF'
+    r'\U0000231A-\U0000231B\U000023E9-\U000023F3\U000023F8-\U000023FA'
+    r'\U000025AA-\U000025AB\U000025B6\U000025C0\U000025FB-\U000025FE'
+    r'\U00002614-\U00002615\U00002648-\U00002653\U0000267F\U00002693'
+    r'\U000026A1\U000026AA-\U000026AB\U000026BD-\U000026BE\U000026C4-\U000026C5'
+    r'\U000026CE\U000026D4\U000026EA\U000026F2-\U000026F3\U000026F5\U000026FA'
+    r'\U000026FD\U00002934-\U00002935\U00002B05-\U00002B07\U00002B1B-\U00002B1C'
+    r'\U00002B50\U00002B55\U00003030\U0000303D\U00003297\U00003299'
+    r'\uFE0F]+)\s*(.*)',
+    re.DOTALL
+)
+
+
+def split_emoji_name(section_name):
+    """Split '🔥 Daily Ops' into ('🔥', 'Daily Ops'). Returns (emoji, text)."""
+    m = _EMOJI_RE.match(section_name)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None, section_name.strip()
+
+
+# Unicode emoji → Slack emoji shortcode mapping for sidebar emoji.
+# The emoji picker search works with shortcode text.
+# For emoji not in this map, we derive a search term from the Unicode name.
+_EMOJI_TO_SHORTCODE = {
+    # Overrides where Slack's shortcode differs from the Unicode name
+    '🔥': 'fire',
+    '👥': 'busts_in_silhouette',
+    '🚀': 'rocket',
+    '⚡': 'zap',
+    '🤖': 'robot_face',
+    '📡': 'satellite',
+    '💻': 'computer',
+    '🔧': 'wrench',
+    '🏗️': 'building_construction',
+    '🏗': 'building_construction',
+    '🏛️': 'classical_building',
+    '🏛': 'classical_building',
+    '🛡️': 'shield',
+    '🛡': 'shield',
+    '🎉': 'tada',
+    '📦': 'package',
+    '⏳': 'hourglass',
+    '❓': 'question',
+    '⭐': 'star',
+    '💡': 'bulb',
+    '📋': 'clipboard',
+    '🔒': 'lock',
+    '📌': 'pushpin',
+    '🎯': 'dart',
+    '💬': 'speech_balloon',
+    '🔔': 'bell',
+    '🤝': 'handshake',
+    '🌐': 'globe',
+    '📊': 'bar_chart',
+    '📈': 'chart',
+    '🔍': 'mag',
+    '✅': 'white_check_mark',
+    '❗': 'exclamation',
+    '🛠️': 'hammer_and_wrench',
+    '🛠': 'hammer_and_wrench',
+    '📝': 'memo',
+    '✨': 'sparkles',
+    '👀': 'eyes',
+    '🤔': 'thinking',
+    '🙏': 'pray',
+    '💪': 'muscle',
+    '⚙️': 'gear',
+    '⚙': 'gear',
+    '☕': 'coffee',
+}
+
+
+def _emoji_search_term(emoji_char):
+    """Get a search term for the Slack emoji picker.
+
+    Uses the explicit shortcode map first, then falls back to the
+    Unicode character name (e.g. 🧠 → 'brain', 🖥 → 'desktop computer').
+    The Unicode name works well because Slack indexes emoji by these names.
+    """
+    shortcode = _EMOJI_TO_SHORTCODE.get(emoji_char)
+    if shortcode:
+        return shortcode
+    # Strip variation selectors (️ U+FE0F) for lookup
+    base = emoji_char.rstrip('\ufe0f')
+    shortcode = _EMOJI_TO_SHORTCODE.get(base)
+    if shortcode:
+        return shortcode
+    # Derive from Unicode name: "OFFICE BUILDING" → "office building"
+    import unicodedata
+    try:
+        name = unicodedata.name(base[0]).lower()
+        # Use first two words to keep search broad enough
+        words = name.split()
+        return ' '.join(words[:2]) if len(words) > 2 else name
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Channels "Active only" / "All" mode toggle
+# ---------------------------------------------------------------------------
+
+async def switch_sidebar_to_all_activity(page):
+    """Switch sidebar to show all channels via the cog settings menu.
+
+    Uses the sidebar cog → Filter and Sort → All Activity, which shows all
+    channels including dormant ones in a single click.
+    """
+    await dismiss_menus(page)
+    await scroll_to(page, 0)
+    await page.wait_for_timeout(500)
+
+    # The sidebar settings gear is data-qa="sweeper_button" with
+    # aria-label="Manage my sidebar".
+    cog = await page.query_selector('[data-qa="sweeper_button"]')
+    if not cog:
+        cog = await page.query_selector('button[aria-label="Manage my sidebar"]')
+    if not cog:
+        print("  WARNING: Sidebar cog/filter button not found", file=sys.stderr)
+        return False
+
+    await cog.click(force=True)
+    await page.wait_for_timeout(1500)
+
+    # Click "Filter and sort" — its text includes a faux status indicator
+    # like "All" appended, so match on the prefix.
+    filter_btn = None
+    items = await page.query_selector_all('[role="menuitem"]')
+    for item in items:
+        text = (await item.text_content() or "").strip()
+        if text.startswith("Filter and sort"):
+            filter_btn = item
+            break
+
+    if not filter_btn:
+        print("  WARNING: 'Filter and sort' menu item not found", file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+
+    await filter_btn.click(force=True)
+    await page.wait_for_timeout(1500)
+
+    # A submenu replaced the parent menu. Find "All activity" in it.
+    # The item is role="menuitemcheckbox" and text may contain linebreaks.
+    all_btn = None
+    submenu_items = await page.query_selector_all(
+        '[role="menuitemradio"], [role="menuitemcheckbox"], '
+        '[role="option"], [role="menuitem"]')
+    texts = []
+    for item in submenu_items:
+        text = " ".join((await item.text_content() or "").split())
+        texts.append(text)
+        if "All activity" in text:
+            all_btn = item
+            break
+
+    if not all_btn:
+        print(f"  WARNING: 'All activity' not found. Items: {texts[:15]}",
+              file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+
+    await all_btn.click()
+    await page.wait_for_timeout(2000)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Section operations
+# ---------------------------------------------------------------------------
+
+async def create_section(page, section_name):
+    """Create a new section via the sidebar cog → Create a section.
+
+    If section_name contains a leading emoji (e.g. '🔥 Daily Ops'), the emoji
+    is set via the emoji picker button and only the text part is typed into the
+    name field.
+    """
+    section_emoji, section_text = split_emoji_name(section_name)
+    print(f"  CREATE section: '{section_text}'"
+          + (f" with emoji {section_emoji}" if section_emoji else ""),
+          file=sys.stderr)
+
+    await dismiss_menus(page)
+    await scroll_to(page, 0)
+    await page.wait_for_timeout(500)
+
+    # Click sidebar cog → "Create a section"
+    cog = await page.query_selector('[data-qa="sweeper_button"]')
+    if not cog:
+        print(f"    ERROR: sweeper_button not found", file=sys.stderr)
+        return False
+    await cog.click(force=True)
+    await page.wait_for_timeout(1500)
+
+    items = await page.query_selector_all('[role="menuitem"]')
+    create_clicked = False
+    for item in items:
+        text = (await item.text_content() or "").strip()
+        if "Create a section" in text:
+            await item.click(force=True)
+            create_clicked = True
+            break
+    if not create_clicked:
+        print(f"    ERROR: 'Create a section' menu item not found", file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+    await page.wait_for_timeout(1500)
+
+    # Fill section name (text only, no emoji)
+    input_el = await page.query_selector('[data-qa="channel-section-search-select-input"]')
+    if not input_el:
+        input_el = await page.query_selector('input[type="text"]')
+    if not input_el:
+        print(f"    ERROR: no input field for section name", file=sys.stderr)
+        await page.keyboard.press("Escape")
+        return False
+
+    await input_el.fill(section_text)
+    await page.wait_for_timeout(500)
+
+    # Dismiss suggestion dropdown if it appeared (common names like "Social").
+    # Only press Escape if suggestions are visible, otherwise it closes the dialog.
+    has_suggestions = await page.evaluate('''() => {
+        const opts = document.querySelectorAll('[role="option"]');
+        for (const o of opts) {
+            if (o.offsetParent !== null) return true;
+        }
+        return false;
+    }''')
+    if has_suggestions:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+
+    # Set emoji via the emoji picker button (if emoji specified)
+    if section_emoji:
+        search_term = _emoji_search_term(section_emoji)
+        if not search_term:
+            print(f"    WARNING: cannot derive search term for {section_emoji}, skipping", file=sys.stderr)
+        else:
+            emoji_btn = await page.query_selector(
+                '[data-qa="channel_selection_modal_input_emoji_picker"]')
+            if emoji_btn:
+                await emoji_btn.click(force=True)
+                await page.wait_for_timeout(1500)
+
+                # Retry finding the emoji search input (picker may be slow to render)
+                emoji_search = None
+                for _attempt in range(3):
+                    emoji_search = await page.query_selector('[data-qa="emoji_picker_input"]')
+                    if emoji_search:
+                        break
+                    await page.wait_for_timeout(500)
+
+                if emoji_search:
+                    await emoji_search.fill(search_term)
+                    await page.wait_for_timeout(800)
+
+                    emoji_result = await page.query_selector('button[data-qa="emoji_list_item"]')
+                    if emoji_result:
+                        await emoji_result.click()
+                        await page.wait_for_timeout(500)
+                        print(f"    Set emoji: {section_emoji} (searched '{search_term}')", file=sys.stderr)
+                    else:
+                        print(f"    WARNING: emoji result not found for '{search_term}', skipping", file=sys.stderr)
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
+                else:
+                    print(f"    WARNING: emoji search input not found after retries, skipping", file=sys.stderr)
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(300)
+            else:
+                print(f"    WARNING: emoji picker button not found, skipping", file=sys.stderr)
+
+    # Click the "Create" button (verified selector)
+    create_btn2 = await page.query_selector('[data-qa="channel_selection_modal_input_go"]')
+    if create_btn2:
+        # Slack uses aria-disabled, not the HTML disabled attribute
+        aria_disabled = await create_btn2.get_attribute("aria-disabled")
+        if aria_disabled == "true":
+            print(f"    WARNING: Create button is disabled (name may be empty)", file=sys.stderr)
+        else:
+            await create_btn2.click()
+            await page.wait_for_timeout(1500)
+    else:
+        # Slack may show a suggestion UI for common names (e.g. "Social")
+        # where the standard Create button is absent. Press Enter to submit.
+        print(f"    Create button not found, pressing Enter to submit", file=sys.stderr)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1500)
+
+    # Dismiss remaining UI
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(500)
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(500)
+
+    # Verify
+    new_sec = await find_section_in_sidebar(page, section_text)
+    if new_sec:
+        print(f"    OK: created '{section_text}'", file=sys.stderr)
+        return True
+    else:
+        print(f"    WARNING: could not verify '{section_text}' was created", file=sys.stderr)
+        return True  # Proceed anyway
+
+
+async def move_channel(page, channel_name, target_section, treeitem=None):
+    """Move a channel to a section via right-click → Move channel → select section.
+
+    If treeitem is provided, skips the scroll-to-find step (used by scan mode).
+    """
+    _, target_text = split_emoji_name(target_section)
+
+    await dismiss_menus(page)
+
+    # Find the channel treeitem (scrolls and returns the element)
+    if treeitem is None:
+        treeitem = await find_channel_in_sidebar(page, channel_name)
+    if not treeitem:
+        print(f"    SKIP: #{channel_name} not found in sidebar", file=sys.stderr)
+        return False
+
+    # Right-click must use force=True — virtualised list coordinates can be
+    # unreliable and the element may be partially off-screen.
+    await treeitem.click(button="right", force=True)
+    await page.wait_for_timeout(1000)
+
+    # CRITICAL: data-qa="channel_ctx_menu_move" is shared by BOTH
+    # "Edit notifications" AND "Move channel". Must hover the submenu
+    # trigger wrapper that contains "Move channel" text.
+    triggers = await page.query_selector_all('[data-qa="submenu_trigger_wrapper"]')
+    move_trigger = None
+    for trigger in triggers:
+        text = await trigger.text_content()
+        if text and "Move channel" in text:
+            move_trigger = trigger
+            break
+
+    if not move_trigger:
+        print(f"    ERROR: 'Move channel' submenu not found for #{channel_name}",
+              file=sys.stderr)
+        await dismiss_menus(page)
+        return False
+
+    # Hover to open submenu (not click — the submenu opens on hover)
+    await move_trigger.hover()
+    await page.wait_for_timeout(1000)
+
+    # Find the target section in the move submenu.
+    # Each section appears twice in the DOM: a wrapper element and the actual
+    # clickable item. Filter out wrappers with :not([data-qa$="-wrapper"]).
+    section_items = await page.query_selector_all(
+        '[data-qa^="section-"]:not([data-qa$="-wrapper"])')
+
+    for item in section_items:
+        text = (await item.text_content() or "").strip()
+        _, item_text = split_emoji_name(text)
+        if item_text == target_text:
+            await item.click()
+            await page.wait_for_timeout(800)
+            await dismiss_menus(page)
+            return True
+
+    # Fallback: partial match
+    for item in section_items:
+        text = (await item.text_content() or "").strip()
+        if target_text in text:
+            print(f"    OK: partial match '{text}' for target '{target_text}'",
+                  file=sys.stderr)
+            await item.click()
+            await page.wait_for_timeout(800)
+            await dismiss_menus(page)
+            return True
+
+    available = []
+    for item in section_items:
+        text = (await item.text_content() or "").strip()
+        if text:
+            available.append(text)
+    print(f"    ERROR: target section '{target_text}' not found in Move submenu",
+          file=sys.stderr)
+    print(f"    DEBUG: available sections: {available[:15]}", file=sys.stderr)
+    await dismiss_menus(page)
+    return False
+
+
+async def move_channels_by_scan(page, moves):
+    """Move channels by linearly scanning the sidebar top-to-bottom.
+
+    Instead of searching for each channel individually (O(n) scroll per channel),
+    this scans downward through the virtualised list. For each visible channel
+    that needs moving, it moves it immediately (no extra scrolling needed).
+    After each move the sidebar reflows, so we re-scan from the current position.
+    Repeats until a full scan finds nothing left to move.
+    """
+    # Build lookup: channel_name → target_section (text only, no emoji)
+    move_map = {}
+    for m in moves:
+        _, target_text = split_emoji_name(m["to"])
+        move_map[m["channel"]] = target_text
+
+    total = len(move_map)
+    completed = 0
+    failed = 0
+    step_size = 200
+    max_passes = 3  # safety limit on full rescans
+
+    for pass_num in range(max_passes):
+        moved_this_pass = 0
+        scroll_pos = 0
+        scroll_height = await get_scroll_height(page)
+        max_scroll = scroll_height + step_size
+
+        current_section = None
+
+        while scroll_pos < max_scroll:
+            await scroll_to(page, scroll_pos)
+            await page.wait_for_timeout(150)
+
+            # Read all visible treeitems
+            treeitems = await page.query_selector_all('[role="treeitem"]')
+
+            for ti in treeitems:
+                # Check if it's a section heading
+                heading = await ti.query_selector('[data-qa*="section_heading"]')
+                if heading:
+                    ht = (await heading.text_content() or "").strip()
+                    _, current_section = split_emoji_name(ht)
+                    continue
+
+                # Check if it's a channel
+                ch = await ti.query_selector('[data-qa="channel-sidebar-channel"]')
+                if not ch:
+                    continue
+                ch_name = (await ch.text_content() or "").strip()
+
+                if ch_name not in move_map:
+                    continue
+                target = move_map[ch_name]
+
+                # Already in the right section? Skip.
+                if current_section and current_section == target:
+                    continue
+
+                # Move it
+                print(f"  #{ch_name} → '{target}'", file=sys.stderr)
+                ok = await move_channel(page, ch_name, target, treeitem=ti)
+                if ok:
+                    completed += 1
+                    moved_this_pass += 1
+                    del move_map[ch_name]
+                    await page.wait_for_timeout(300)
+                    # After a successful move the sidebar reflows — break and re-scan
+                    break
+                else:
+                    failed += 1
+                    # Failed move (e.g., DM or Slack Connect) — remove from map and continue
+                    del move_map[ch_name]
+                    # Don't break — continue scanning this batch of items
+            else:
+                # for-loop completed without breaking (no successful move)
+                # Advance scroll to next batch
+                scroll_pos += step_size
+
+        if moved_this_pass == 0:
+            break  # Full scan with no moves — we're done
+
+    if move_map:
+        print(f"  WARNING: {len(move_map)} channels not found during scan", file=sys.stderr)
+        for ch_name in list(move_map.keys())[:10]:
+            print(f"    - #{ch_name}", file=sys.stderr)
+
+    return completed, failed
+
+
+async def delete_section(page, section_name):
+    """Delete a section via right-click → Manage → Delete."""
+    _, section_text = split_emoji_name(section_name)
+    print(f"  DELETE section: '{section_text}'", file=sys.stderr)
+
+    await dismiss_menus(page)
+    section = await find_section_in_sidebar(page, section_text)
+    if not section:
+        print(f"    SKIP: section '{section_text}' not found (may already be deleted)",
+              file=sys.stderr)
+        return True
+
+    await section.click(button="right", force=True)
+    await page.wait_for_timeout(1000)
+
+    # Hover "Manage" submenu trigger
+    triggers = await page.query_selector_all('[data-qa="submenu_trigger_wrapper"]')
+    found = False
+    for trigger in triggers:
+        text = await trigger.text_content()
+        if text and "Manage" in text:
+            await trigger.hover()
+            found = True
+            break
+    if not found:
+        print(f"    ERROR: 'Manage' submenu not found", file=sys.stderr)
+        await dismiss_menus(page)
+        return False
+    await page.wait_for_timeout(1000)
+
+    delete_btn = await page.query_selector('[data-qa="channel_section_menu_remove_channel_section"]')
+    if not delete_btn:
+        print(f"    ERROR: delete option not found", file=sys.stderr)
+        await dismiss_menus(page)
+        return False
+
+    await delete_btn.click()
+    await page.wait_for_timeout(1500)
+
+    # Handle confirmation dialog
+    confirm = await page.query_selector('button:has-text("Delete")')
+    if confirm:
+        await confirm.click()
+        await page.wait_for_timeout(1000)
+
+    print(f"    OK: deleted '{section_text}'", file=sys.stderr)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main execution
+# ---------------------------------------------------------------------------
+
+async def execute_plan(plan, session_dir, workspace_url, dry_run=False,
+                       skip_phases=None):
+    """Execute the reorganization plan.
+
+    skip_phases: set of phase names to skip ("delete", "create", "move")
+    """
+    skip_phases = skip_phases or set()
+    stats = plan.get("stats", {})
+    total_ops = (stats.get("sections_to_create", 0) +
+                 stats.get("channels_to_move", 0) +
+                 stats.get("sections_to_delete", 0))
+
+    print(f"\n{'DRY RUN — ' if dry_run else ''}Reorganization plan:", file=sys.stderr)
+    print(f"  Create: {stats.get('sections_to_create', 0)} sections", file=sys.stderr)
+    print(f"  Move:   {stats.get('channels_to_move', 0)} channels", file=sys.stderr)
+    print(f"  Delete: {stats.get('sections_to_delete', 0)} sections", file=sys.stderr)
+    print(f"  Total:  {total_ops} operations", file=sys.stderr)
+
+    if plan.get("warnings"):
+        print(f"\n  Warnings:", file=sys.stderr)
+        for w in plan["warnings"][:10]:
+            print(f"    ⚠ {w}", file=sys.stderr)
+        if len(plan["warnings"]) > 10:
+            print(f"    ... and {len(plan['warnings']) - 10} more", file=sys.stderr)
+
+    if dry_run:
+        print("\nDry run complete. No changes made.", file=sys.stderr)
+        return
+
+    # Execute
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=session_dir,
+            headless=False,
+            viewport={"width": 1400, "height": 900},
+            slow_mo=100,
+            args=["--disable-features=ExternalProtocolDialog"],
+        )
+
+        page = await context.new_page()
+
+        if not await navigate_to_slack(page, workspace_url):
+            print("FATAL: could not load Slack workspace", file=sys.stderr)
+            await context.close()
+            return
+
+        await page.wait_for_timeout(2000)
+
+        # Close any panels
+        close_btn = await page.query_selector('[data-qa="close_flexpane"]')
+        if close_btn:
+            await close_btn.click()
+            await page.wait_for_timeout(500)
+
+        start_time = time.time()
+        completed = 0
+        failed = 0
+
+        # Phase 1: Delete existing custom sections
+        # Channels in deleted sections fall back to "Channels" built-in section.
+        if plan.get("delete_sections") and "delete" not in skip_phases:
+            print(f"\n{'='*50}", file=sys.stderr)
+            print(f"PHASE 1: Deleting {len(plan['delete_sections'])} sections", file=sys.stderr)
+            print(f"{'='*50}", file=sys.stderr)
+            for name in plan["delete_sections"]:
+                ok = await delete_section(page, name)
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                await page.wait_for_timeout(500)
+        elif "delete" in skip_phases:
+            print(f"\nSKIPPING Phase 1 (delete)", file=sys.stderr)
+
+        # Phase 2: Create sections fresh (with emoji)
+        # Slack inserts new sections at the top, so create in reverse order
+        # so the final top-to-bottom order matches the desired layout.
+        if plan.get("create_sections") and "create" not in skip_phases:
+            create_order = list(reversed(plan["create_sections"]))
+            print(f"\n{'='*50}", file=sys.stderr)
+            print(f"PHASE 2: Creating {len(create_order)} sections (reversed)", file=sys.stderr)
+            print(f"{'='*50}", file=sys.stderr)
+            for name in create_order:
+                ok = await create_section(page, name)
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                await page.wait_for_timeout(500)
+        elif "create" in skip_phases:
+            print(f"\nSKIPPING Phase 2 (create)", file=sys.stderr)
+
+        # Phase 3: Move channels (linear scan approach)
+        if plan.get("moves") and "move" not in skip_phases:
+            # Switch sidebar to show all channels (including dormant)
+            print(f"\nSwitching sidebar to show all channels...", file=sys.stderr)
+            await switch_sidebar_to_all_activity(page)
+            await page.wait_for_timeout(2000)
+
+            moves = plan["moves"]
+            print(f"\n{'='*50}", file=sys.stderr)
+            print(f"PHASE 3: Moving {len(moves)} channels (scan mode)", file=sys.stderr)
+            print(f"{'='*50}", file=sys.stderr)
+
+            # Scroll to top before scanning
+            await scroll_to(page, 0)
+            await page.wait_for_timeout(500)
+
+            m_ok, m_fail = await move_channels_by_scan(page, moves)
+            completed += m_ok
+            failed += m_fail
+        elif "move" in skip_phases:
+            print(f"\nSKIPPING Phase 3 (move)", file=sys.stderr)
+
+        elapsed = time.time() - start_time
+        print(f"\n{'='*50}", file=sys.stderr)
+        print(f"COMPLETE: {completed} succeeded, {failed} failed in {elapsed:.0f}s", file=sys.stderr)
+        print(f"{'='*50}", file=sys.stderr)
+
+        # Output results as JSON
+        result = {
+            "completed": completed,
+            "failed": failed,
+            "elapsed_seconds": round(elapsed),
+        }
+        print(json.dumps(result, indent=2))
+
+        await context.close()
+
+        if failed > 0:
+            sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Execute Slack sidebar reorganization")
+    parser.add_argument("--plan", required=True,
+                        help="Path to action plan JSON (from diff-layout)")
+    parser.add_argument("--session-dir", default=None,
+                        help="Path to Playwright browser profile (default: ~/.slack-reorg/sessions/{workspace}/")
+    parser.add_argument("--workspace", required=True,
+                        help="Slack workspace URL (e.g., https://mycompany.slack.com)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be done without making changes")
+    parser.add_argument("--skip-phases", nargs="+", choices=["delete", "create", "move"],
+                        default=[], help="Skip these phases (e.g., --skip-phases delete create)")
+    args = parser.parse_args()
+
+    plan_path = Path(args.plan).expanduser()
+    if not plan_path.exists():
+        print(f"ERROR: {plan_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(plan_path) as f:
+        plan = json.load(f)
+
+    if args.session_dir:
+        session_dir = str(Path(args.session_dir).expanduser().resolve())
+    else:
+        session_dir = session_dir_for_workspace(args.workspace)
+
+    if args.dry_run:
+        asyncio.run(execute_plan(plan, session_dir, args.workspace, dry_run=True,
+                                 skip_phases=set(args.skip_phases)))
+    else:
+        asyncio.run(execute_plan(plan, session_dir, args.workspace,
+                                 skip_phases=set(args.skip_phases)))
+
+
+if __name__ == "__main__":
+    main()
