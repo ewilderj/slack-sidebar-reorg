@@ -177,6 +177,20 @@ Repeat until diff shows zero moves.
 The delete-first strategy ensures emoji are always set correctly and avoids
 conflicts with existing sections.
 
+Because this is UI manipulation via a real browser, things can and will go
+wrong — menus fail to open, clicks land in the wrong place, the sidebar
+reflows unexpectedly. The right approach is to **repeat until done**: re-extract,
+re-diff, re-execute. Use `--skip-phases` to avoid redoing work that already
+succeeded:
+
+```bash
+# Sections are fine, just need to finish moving channels:
+uv run scripts/execute-reorg --plan action-plan.json --workspace https://mycompany.slack.com --skip-phases delete create
+
+# Only need to recreate sections (moves will be re-scanned automatically):
+uv run scripts/execute-reorg --plan action-plan.json --workspace https://mycompany.slack.com --skip-phases delete
+```
+
 ## Known limitations
 
 - Slack Connect channels and DMs cannot be moved between sections (automatically skipped)
