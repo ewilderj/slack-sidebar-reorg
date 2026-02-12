@@ -7,6 +7,8 @@ automatically.
 Built with [GitHub Copilot CLI](https://github.com/features/copilot/cli)
 and Claude Opus 4.6. Designed as an AI coding agent skill, but the scripts work standalone too.
 
+![The agent proposes a sidebar layout for your approval](screenshot.png)
+
 > **⚠️ Before you start:**
 > - **This takes time.** Execution puppets a real browser, clicking through
 >   Slack menus one channel at a time. A sidebar with 200+ channels can take
