@@ -4,8 +4,50 @@ Automate Slack sidebar organization using Playwright browser automation. Design
 a layout, then execute it — channels get sorted into sections with emoji,
 automatically.
 
-Built as a [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli)
-skill, but the scripts work standalone too.
+Designed as an AI coding agent skill, but the scripts work standalone too.
+
+## Install as an Agent Skill
+
+This repo is structured as an agent skill with a `SKILL.md` that teaches the
+agent the full workflow. Just tell your agent "organize my Slack sidebar" and
+it handles extraction, design, execution, and verification.
+
+### GitHub Copilot (CLI, VS Code, JetBrains)
+
+Clone or symlink into your personal skills directory:
+
+```bash
+# Clone
+git clone https://github.com/ewilderj/slack-sidebar-reorg.git ~/.github/skills/slack-reorg
+
+# Or symlink from an existing clone
+ln -s ~/git/slack-sidebar-reorg ~/.github/skills/slack-reorg
+```
+
+Skills in `~/.github/skills/` are auto-discovered by Copilot across all
+projects. For per-repo use, place in `.github/skills/` instead.
+
+### Claude Code
+
+```bash
+# Global (all projects)
+git clone https://github.com/ewilderj/slack-sidebar-reorg.git ~/.claude/skills/slack-reorg
+
+# Or per-project
+git clone https://github.com/ewilderj/slack-sidebar-reorg.git .claude/skills/slack-reorg
+```
+
+### Gemini CLI
+
+```bash
+# Global
+git clone https://github.com/ewilderj/slack-sidebar-reorg.git ~/.gemini/skills/slack-reorg
+
+# Or per-project
+git clone https://github.com/ewilderj/slack-sidebar-reorg.git .gemini/skills/slack-reorg
+```
+
+---
 
 ## How it works
 
@@ -21,7 +63,9 @@ skill, but the scripts work standalone too.
 - [uv](https://docs.astral.sh/uv/) (scripts are self-contained with inline dependencies)
 - Playwright with Chromium (`uv run --script scripts/login` handles setup)
 
-## Quick Start
+## Standalone Usage
+
+If you're not using an agent, you can run the scripts directly.
 
 ### 1. Login to Slack
 
@@ -101,12 +145,6 @@ uv run scripts/execute-reorg --plan action-plan.json --workspace https://mycompa
 ```
 
 Repeat until diff shows zero moves.
-
-## Using as a Copilot CLI Skill
-
-Copy or symlink this repo into your skills directory (e.g.,
-`~/.github/skills/slack-reorg/`). The `SKILL.md` file tells the Copilot agent
-how to orchestrate the full workflow interactively.
 
 ## Scripts
 
