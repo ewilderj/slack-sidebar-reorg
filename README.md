@@ -4,7 +4,7 @@ Automate Slack sidebar organization using Playwright browser automation. Design
 a layout, then execute it — channels get sorted into sections with emoji,
 automatically.
 
-Built with [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli)
+Built with [GitHub Copilot CLI](https://github.com/features/copilot/cli)
 and Claude Opus 4.6. Designed as an AI coding agent skill, but the scripts work standalone too.
 
 > **⚠️ Before you start:**
