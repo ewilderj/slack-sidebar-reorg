@@ -7,7 +7,7 @@ automatically.
 Built with [GitHub Copilot CLI](https://github.com/features/copilot/cli)
 and Claude Opus 4.6. Designed as an AI coding agent skill, but the scripts work standalone too.
 
-![The agent proposes a sidebar layout for your approval](screenshot.png)
+<a href="screenshot.png"><img src="screenshot.png" alt="The agent proposes a sidebar layout for your approval" width="430"></a>
 
 > **⚠️ Before you start:**
 > - **This takes time.** Execution puppets a real browser, clicking through
